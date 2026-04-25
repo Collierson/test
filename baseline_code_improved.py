@@ -7,6 +7,9 @@ from torch import nn
 from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
+import time
+from datetime import timedelta
+import sys
 
 # 設定隨機種子
 SEED = 39
@@ -95,8 +98,12 @@ class ImprovedMultiTaskLSTM(nn.Module):
         # Layer Normalization
         self.layer_norm = nn.LayerNorm(hidden * 2)
         
-        # 改進的任務頭部（添加中間層）
+        # 改進的任務頭部 - actionId 需要更多的容量
         self.act_head = nn.Sequential(
+            nn.Linear(hidden * 2, hidden * 2),
+            nn.BatchNorm1d(hidden * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden * 2, hidden),
             nn.BatchNorm1d(hidden),
             nn.ReLU(),
@@ -148,8 +155,15 @@ class ImprovedMultiTaskLSTM(nn.Module):
         
         return act_out, pt_out, rly_out
 
+def format_time(seconds):
+    """將秒數轉換為可讀的時間格式"""
+    return str(timedelta(seconds=int(seconds)))
+
 def main(args):
+    print("=" * 80)
     print("正在準備資料與特徵工程...")
+    print("=" * 80)
+    
     train = pd.read_csv(args.train).sort_values(["rally_uid","strikeNumber"])
     test  = pd.read_csv(args.test).sort_values(["rally_uid","strikeNumber"])
 
@@ -203,6 +217,12 @@ def main(args):
     yA_flat = np.vectorize(lambda x: act_map.get(x, -1))(yA_all)
     yP_flat = np.vectorize(lambda x: pt_map.get(x, -1))(yP_all)
 
+    print(f"\n📊 資料統計：")
+    print(f"  • 訓練樣本數: {len(X_cat_all)}")
+    print(f"  • 最大序列長度: {MAXLEN}")
+    print(f"  • Action 類別數: {len(act_map)}")
+    print(f"  • Point 類別數: {len(pt_map)}")
+
     # 計算類別權重
     def get_weights(labels, n_classes):
         valid_labels = labels[labels != -1]
@@ -237,6 +257,8 @@ def main(args):
     
     # 模型初始化
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"\n🖥️  使用設備: {device}")
+    
     model = ImprovedMultiTaskLSTM(
         cat_dims=[len(cats[c]) for c in CAT_FEATURES], 
         num_dim=len(NUM_FEATURES), 
@@ -244,25 +266,43 @@ def main(args):
         n_pt=len(pt_map)
     ).to(device)
     
+    # 計算模型參數
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"  • 總參數數: {total_params:,}")
+    print(f"  • 可訓練參數數: {trainable_params:,}")
+    
     # 優化器和調度器
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-5
     )
     
-    # Loss函數
+    # Loss函數 - 調整權重以優化 actionId
     loss_fn_act = nn.CrossEntropyLoss(weight=act_weights.to(device), ignore_index=-1)
     loss_fn_pt  = nn.CrossEntropyLoss(weight=pt_weights.to(device), ignore_index=-1)
     loss_fn_bin = nn.BCEWithLogitsLoss()
 
-    print(f"開始訓練 (改進模型架構與優化策略)...")
+    print("\n" + "=" * 80)
+    print(f"開始訓練 (改進模型架構與優化策略)")
+    print("=" * 80)
+    print(f"配置: Batch={args.batch}, LR={args.lr}, Epochs={args.epochs}")
+    print(f"損失權重: Action=0.4, Point=0.4, Rally=0.2 (優化actionId)\n")
+    
     best_loss = float('inf')
-    patience = 10
+    patience = 15
     patience_counter = 0
     
+    start_time = time.time()
+    epoch_losses = []
+    
     for ep in range(1, args.epochs + 1):
+        epoch_start = time.time()
         model.train()
         total_loss = 0
+        act_loss_total = 0
+        pt_loss_total = 0
+        rly_loss_total = 0
         num_batches = 0
         
         for xc, xn, ya, yp, yr, l in train_loader:
@@ -277,37 +317,74 @@ def main(args):
             
             pa, pp, pr = model(xc, xn, l)
             
-            # 計算損失（每個樣本一個標籤）
-            loss = 0.25 * loss_fn_act(pa, ya[:, 0]) + \
-                   0.5 * loss_fn_pt(pp, yp[:, 0]) + \
-                   0.25 * loss_fn_bin(pr, yr)
+            # 計算各項損失 - 加強 actionId 權重
+            loss_act = loss_fn_act(pa, ya[:, 0])
+            loss_pt = loss_fn_pt(pp, yp[:, 0])
+            loss_rly = loss_fn_bin(pr, yr)
+            
+            loss = 0.4 * loss_act + 0.4 * loss_pt + 0.2 * loss_rly
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
             total_loss += loss.item()
+            act_loss_total += loss_act.item()
+            pt_loss_total += loss_pt.item()
+            rly_loss_total += loss_rly.item()
             num_batches += 1
         
         avg_loss = total_loss / num_batches
+        avg_act_loss = act_loss_total / num_batches
+        avg_pt_loss = pt_loss_total / num_batches
+        avg_rly_loss = rly_loss_total / num_batches
+        
+        epoch_losses.append(avg_loss)
         scheduler.step()
+        
+        # 計算耗時
+        epoch_time = time.time() - epoch_start
+        elapsed_time = time.time() - start_time
+        
+        # 預計剩餘時間
+        if ep > 0:
+            avg_epoch_time = elapsed_time / ep
+            remaining_epochs = args.epochs - ep
+            estimated_remaining = avg_epoch_time * remaining_epochs
+            eta_time = format_time(estimated_remaining)
         
         # Early stopping
         if avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
+            best_marker = " ✓ (Best)"
         else:
             patience_counter += 1
+            best_marker = ""
         
-        if ep % 5 == 0 or ep == 1:
-            print(f"Epoch {ep:03d} | Avg Loss: {avg_loss:.4f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
+        # 每個 epoch 都顯示詳細信息
+        print(f"Epoch {ep:3d}/{args.epochs} | "
+              f"Loss: {avg_loss:.4f}{best_marker} | "
+              f"Act: {avg_act_loss:.4f} | "
+              f"Pt: {avg_pt_loss:.4f} | "
+              f"Rly: {avg_rly_loss:.4f} | "
+              f"LR: {optimizer.param_groups[0]['lr']:.2e} | "
+              f"⏱️  {format_time(epoch_time)} | "
+              f"ETA: {eta_time}")
         
         if patience_counter >= patience:
-            print(f"Early stopping at epoch {ep}")
+            print(f"\n⏸️  Early stopping at epoch {ep} (patience={patience})")
             break
 
+    total_time = time.time() - start_time
+    print("\n" + "=" * 80)
+    print(f"✅ 訓練完成！")
+    print(f"   總耗時: {format_time(total_time)}")
+    print(f"   最佳損失: {best_loss:.4f}")
+    print("=" * 80)
+
     # 生成預測
-    print("生成預測...")
+    print("\n📝 生成預測...")
     model.eval()
     results = []
     
@@ -328,14 +405,15 @@ def main(args):
             })
 
     pd.DataFrame(results).to_csv(args.out, index=False)
-    print(f"✅ 訓練完成！結果已儲存至 {args.out}")
+    print(f"✅ 結果已儲存至 {args.out}")
+    print(f"📊 預測樣本數: {len(results)}")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--train", default="train.csv")
     parser.add_argument("--test", default="test.csv")
     parser.add_argument("--out", default="submission_lstm_improved.csv")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--lr", type=float, default=3e-4)
     main(parser.parse_args())
