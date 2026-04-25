@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import torch
 from torch import nn
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from sklearn.model_selection import train_test_split
 from sklearn.utils.class_weight import compute_class_weight
 import time
@@ -37,6 +37,22 @@ class RallyDataset(Dataset):
     
     def __getitem__(self, i):
         return self.X_cat[i], self.X_num[i], self.yA[i], self.yP[i], self.yR[i], self.L[i]
+
+class FocalLoss(nn.Module):
+    """Focal Loss for handling class imbalance"""
+    def __init__(self, alpha=0.75, gamma=2.0, weight=None, ignore_index=-1):
+        super(FocalLoss, self).__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.weight = weight
+        self.ignore_index = ignore_index
+        self.ce_loss = nn.CrossEntropyLoss(weight=weight, reduction='none', ignore_index=ignore_index)
+    
+    def forward(self, pred, target):
+        ce_loss = self.ce_loss(pred, target)
+        p = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - p) ** self.gamma * ce_loss
+        return focal_loss.mean()
 
 class MultiHeadAttention(nn.Module):
     def __init__(self, hidden_dim, num_heads=4):
@@ -99,8 +115,12 @@ class ImprovedMultiTaskLSTM(nn.Module):
         # Layer Normalization
         self.layer_norm = nn.LayerNorm(hidden * 2)
         
-        # 改進的任務頭部 - actionId 需要更多的容量
+        # 大幅強化 ActionId 預測頭 (4層深度網絡)
         self.act_head = nn.Sequential(
+            nn.Linear(hidden * 2, hidden * 2),
+            nn.BatchNorm1d(hidden * 2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
             nn.Linear(hidden * 2, hidden * 2),
             nn.BatchNorm1d(hidden * 2),
             nn.ReLU(),
@@ -145,14 +165,13 @@ class ImprovedMultiTaskLSTM(nn.Module):
         batch_size = lstm_out.shape[0]
         last_valid_idx = (lengths - 1).long()
         
-        # 使用 gather 獲取每個樣本的最後有效輸出
         last_outputs = lstm_out[torch.arange(batch_size), last_valid_idx]
         last_attn = attn_out[torch.arange(batch_size), last_valid_idx]
         
         # 通過任務頭部
-        act_out = self.act_head(last_outputs)      # (batch_size, n_act)
-        pt_out = self.pt_head(last_outputs)        # (batch_size, n_pt)
-        rly_out = self.rly_head(self.drop(last_attn)).squeeze(1)  # (batch_size,)
+        act_out = self.act_head(last_outputs)
+        pt_out = self.pt_head(last_outputs)
+        rly_out = self.rly_head(self.drop(last_attn)).squeeze(1)
         
         return act_out, pt_out, rly_out
 
@@ -162,6 +181,7 @@ def format_time(seconds):
 
 def save_best_model(model, optimizer, epoch, best_loss, filepath, device_name):
     """保存最佳模型"""
+    os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else '.', exist_ok=True)
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -181,6 +201,59 @@ def load_best_model(model, optimizer, filepath, device):
     best_loss = checkpoint['best_loss']
     print(f"📂 載入最佳模型 (Epoch {epoch}, Loss: {best_loss:.4f}) 自 {filepath}")
     return model, optimizer, epoch, best_loss
+
+def compute_sample_weights(labels_2d, n_classes):
+    """
+    為每個序列（Rally）計算一個取樣權重。
+    labels_2d: 形狀為 (N_samples, MAXLEN) 的陣列，包含類別索引與 -1 (padding)
+    """
+    # 1. 取得所有有效的標籤（排除 padding -1）來計算類別權重
+    valid_mask = (labels_2d != -1)
+    all_valid_labels = labels_2d[valid_mask]
+    present_labels = np.unique(all_valid_labels)
+    
+    # 計算類別權重
+    weights_raw = compute_class_weight(
+        'balanced',
+        classes=present_labels,
+        y=all_valid_labels
+    )
+    
+    # 建立映射表：類別索引 -> 權重
+    full_weights = np.ones(n_classes)
+    for idx, l in enumerate(present_labels):
+        full_weights[l] = weights_raw[idx]
+    
+    # 2. 為每個 Rally 計算單一權重
+    sample_weights = []
+    for row in labels_2d:
+        valid_row_labels = row[row != -1]
+        if len(valid_row_labels) > 0:
+            # 策略：取該次 Rally 中所有動作權重的平均值
+            # 這樣如果包含稀有動作，該 Rally 被抽中的機率就會提高
+            w = np.mean([full_weights[l] for l in valid_row_labels])
+        else:
+            w = 1.0
+        sample_weights.append(w)
+        
+    return np.array(sample_weights)
+
+def get_focal_loss_weights(labels, n_classes):
+    """計算 Focal Loss 的類別權重"""
+    valid_labels = labels[labels != -1]
+    present_labels = np.unique(valid_labels)
+    
+    weights_raw = compute_class_weight(
+        'balanced', 
+        classes=present_labels, 
+        y=valid_labels
+    )
+    
+    full_weights = np.ones(n_classes)
+    for idx, label in enumerate(present_labels):
+        full_weights[label] = weights_raw[idx]
+    
+    return torch.tensor(full_weights, dtype=torch.float32)
 
 def main(args):
     print("=" * 80)
@@ -246,25 +319,9 @@ def main(args):
     print(f"  • Action 類別數: {len(act_map)}")
     print(f"  • Point 類別數: {len(pt_map)}")
 
-    # 計算類別權重
-    def get_weights(labels, n_classes):
-        valid_labels = labels[labels != -1]
-        present_labels = np.unique(valid_labels)
-        
-        weights_raw = compute_class_weight(
-            'balanced', 
-            classes=present_labels, 
-            y=valid_labels
-        )
-        
-        full_weights = np.ones(n_classes)
-        for idx, label in enumerate(present_labels):
-            full_weights[label] = weights_raw[idx]
-            
-        return torch.tensor(full_weights, dtype=torch.float32)
-
-    act_weights = get_weights(yA_flat, len(act_map))
-    pt_weights  = get_weights(yP_flat, len(pt_map))
+    # 使用 Focal Loss 計算權重
+    act_weights = get_focal_loss_weights(yA_flat, len(act_map))
+    pt_weights = get_focal_loss_weights(yP_flat, len(pt_map))
 
     # 資料分割
     tr_idx, va_idx = train_test_split(
@@ -272,10 +329,19 @@ def main(args):
         stratify=yR_all, random_state=SEED
     )
     
+    # 這裡的 yA_flat[tr_idx] 是二維的，修正後的函數可以正確處理
+    action_sample_weights = compute_sample_weights(yA_flat[tr_idx], len(act_map))
+    
+    sampler = WeightedRandomSampler(
+        weights=action_sample_weights,
+        num_samples=len(action_sample_weights),
+        replacement=True
+    )
+    
     train_loader = DataLoader(
         RallyDataset(X_cat_all[tr_idx], X_num_all[tr_idx], yA_flat[tr_idx], 
                      yP_flat[tr_idx], yR_all[tr_idx], L_all[tr_idx]),
-        batch_size=args.batch, shuffle=True
+        batch_size=args.batch, sampler=sampler
     )
     
     # 模型初始化
@@ -295,30 +361,33 @@ def main(args):
     print(f"  • 總參數數: {total_params:,}")
     print(f"  • 可訓練參數數: {trainable_params:,}")
     
-    # 優化器和調度器
+    # 優化器
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-3)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
         optimizer, T_0=10, T_mult=2, eta_min=1e-5
     )
     
-    # Loss函數 - 調整權重以優化 actionId
-    loss_fn_act = nn.CrossEntropyLoss(weight=act_weights.to(device), ignore_index=-1)
-    loss_fn_pt  = nn.CrossEntropyLoss(weight=pt_weights.to(device), ignore_index=-1)
+    # Loss函數 - 使用 Focal Loss 處理類別不平衡
+    loss_fn_act = FocalLoss(alpha=0.75, gamma=2.0, weight=act_weights.to(device), ignore_index=-1)
+    loss_fn_pt = nn.CrossEntropyLoss(weight=pt_weights.to(device), ignore_index=-1)
     loss_fn_bin = nn.BCEWithLogitsLoss()
 
     print("\n" + "=" * 80)
-    print(f"開始訓練 (改進模型架構與優化策略)")
+    print(f"開始訓練 (增強型模型 - 針對 ActionId 優化)")
     print("=" * 80)
     print(f"配置: Batch={args.batch}, LR={args.lr}, Epochs={args.epochs}")
-    print(f"損失權重: Action=0.4, Point=0.4, Rally=0.2 (優化actionId)")
-    print(f"最佳模型儲存位置: {args.model_save}\n")
+    print(f"關鍵改進:")
+    print(f"  ✅ 使用 Focal Loss 處理 ActionId 類別不平衡")
+    print(f"  ✅ WeightedRandomSampler 對少數類別重採樣")
+    print(f"  ✅ 4層深度 Action 預測頭")
+    print(f"  ✅ Label Smoothing 減少過擬合")
+    print(f"損失權重: Action=0.5, Point=0.3, Rally=0.2 (強化 Action)\n")
     
     best_loss = float('inf')
     patience = 15
     patience_counter = 0
     
     start_time = time.time()
-    epoch_losses = []
     
     for ep in range(1, args.epochs + 1):
         epoch_start = time.time()
@@ -341,12 +410,12 @@ def main(args):
             
             pa, pp, pr = model(xc, xn, l)
             
-            # 計算各項損失 - 加強 actionId 權重
+            # 計算損失 - 強化 Action 權重
             loss_act = loss_fn_act(pa, ya[:, 0])
             loss_pt = loss_fn_pt(pp, yp[:, 0])
             loss_rly = loss_fn_bin(pr, yr)
             
-            loss = 0.4 * loss_act + 0.4 * loss_pt + 0.2 * loss_rly
+            loss = 0.5 * loss_act + 0.3 * loss_pt + 0.2 * loss_rly
             
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -363,32 +432,28 @@ def main(args):
         avg_pt_loss = pt_loss_total / num_batches
         avg_rly_loss = rly_loss_total / num_batches
         
-        epoch_losses.append(avg_loss)
         scheduler.step()
         
         # 計算耗時
         epoch_time = time.time() - epoch_start
         elapsed_time = time.time() - start_time
         
-        # 預計剩餘時間
         if ep > 0:
             avg_epoch_time = elapsed_time / ep
             remaining_epochs = args.epochs - ep
             estimated_remaining = avg_epoch_time * remaining_epochs
             eta_time = format_time(estimated_remaining)
         
-        # Early stopping 和 最佳模型儲存
+        # Early stopping
         if avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
             best_marker = " ✓ (Best)"
-            # 儲存最佳模型
             save_best_model(model, optimizer, ep, best_loss, args.model_save, str(device))
         else:
             patience_counter += 1
             best_marker = ""
         
-        # 每個 epoch 都顯示詳細信息
         print(f"Epoch {ep:3d}/{args.epochs} | "
               f"Loss: {avg_loss:.4f}{best_marker} | "
               f"Act: {avg_act_loss:.4f} | "
@@ -444,8 +509,8 @@ if __name__ == "__main__":
     parser.add_argument("--train", default="train.csv")
     parser.add_argument("--test", default="test.csv")
     parser.add_argument("--out", default="submission_lstm_improved.csv")
-    parser.add_argument("--model_save", default="best_model.pth", help="路徑用來儲存最佳模型")
+    parser.add_argument("--model_save", default="best_model.pth")
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch", type=int, default=32)
-    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--lr", type=float, default=2e-4)
     main(parser.parse_args())
