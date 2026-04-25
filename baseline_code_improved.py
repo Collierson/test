@@ -10,6 +10,7 @@ from sklearn.utils.class_weight import compute_class_weight
 import time
 from datetime import timedelta
 import sys
+import os
 
 # 設定隨機種子
 SEED = 39
@@ -159,6 +160,28 @@ def format_time(seconds):
     """將秒數轉換為可讀的時間格式"""
     return str(timedelta(seconds=int(seconds)))
 
+def save_best_model(model, optimizer, epoch, best_loss, filepath, device_name):
+    """保存最佳模型"""
+    checkpoint = {
+        'epoch': epoch,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'best_loss': best_loss,
+        'device': device_name
+    }
+    torch.save(checkpoint, filepath)
+    print(f"💾 最佳模型已儲存至 {filepath}")
+
+def load_best_model(model, optimizer, filepath, device):
+    """載入最佳模型"""
+    checkpoint = torch.load(filepath, map_location=device)
+    model.load_state_dict(checkpoint['model_state_dict'])
+    optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+    epoch = checkpoint['epoch']
+    best_loss = checkpoint['best_loss']
+    print(f"📂 載入最佳模型 (Epoch {epoch}, Loss: {best_loss:.4f}) 自 {filepath}")
+    return model, optimizer, epoch, best_loss
+
 def main(args):
     print("=" * 80)
     print("正在準備資料與特徵工程...")
@@ -287,7 +310,8 @@ def main(args):
     print(f"開始訓練 (改進模型架構與優化策略)")
     print("=" * 80)
     print(f"配置: Batch={args.batch}, LR={args.lr}, Epochs={args.epochs}")
-    print(f"損失權重: Action=0.4, Point=0.4, Rally=0.2 (優化actionId)\n")
+    print(f"損失權重: Action=0.4, Point=0.4, Rally=0.2 (優化actionId)")
+    print(f"最佳模型儲存位置: {args.model_save}\n")
     
     best_loss = float('inf')
     patience = 15
@@ -353,11 +377,13 @@ def main(args):
             estimated_remaining = avg_epoch_time * remaining_epochs
             eta_time = format_time(estimated_remaining)
         
-        # Early stopping
+        # Early stopping 和 最佳模型儲存
         if avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
             best_marker = " ✓ (Best)"
+            # 儲存最佳模型
+            save_best_model(model, optimizer, ep, best_loss, args.model_save, str(device))
         else:
             patience_counter += 1
             best_marker = ""
@@ -381,8 +407,13 @@ def main(args):
     print(f"✅ 訓練完成！")
     print(f"   總耗時: {format_time(total_time)}")
     print(f"   最佳損失: {best_loss:.4f}")
+    print(f"   最佳模型檔案: {args.model_save}")
     print("=" * 80)
 
+    # 載入最佳模型進行預測
+    print("\n📂 載入最佳模型進行預測...")
+    model, optimizer, best_ep, best_loss_val = load_best_model(model, optimizer, args.model_save, device)
+    
     # 生成預測
     print("\n📝 生成預測...")
     model.eval()
@@ -413,6 +444,7 @@ if __name__ == "__main__":
     parser.add_argument("--train", default="train.csv")
     parser.add_argument("--test", default="test.csv")
     parser.add_argument("--out", default="submission_lstm_improved.csv")
+    parser.add_argument("--model_save", default="best_model.pth", help="路徑用來儲存最佳模型")
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch", type=int, default=32)
     parser.add_argument("--lr", type=float, default=3e-4)
