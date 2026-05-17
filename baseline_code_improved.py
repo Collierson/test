@@ -298,7 +298,7 @@ def main(args):
     # 降低學習率以提升穩定性
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode='max', factor=0.5, patience=3, verbose=True
+        opt, mode='max', factor=0.5, patience=3
     )
 
     best_score = -1
