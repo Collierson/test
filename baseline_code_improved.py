@@ -3,6 +3,14 @@ baseline_code_annotated.py
 
 多任務 LSTM 模型：預測乒乓球比賽的下一個動作(actionId)、
 得分類型(pointId)，以及發球方是否得分(serverGetPoint)。
+
+【優化改進】
+1. 雙向 LSTM (Bidirectional) - 提升 actionId/pointId
+2. 特徵融合層 (Fusion Layer) - 改進動作預測
+3. 提高 actionId/pointId 的損失權重 (50%/30%/20%)
+4. 動態學習率調度
+5. 增加模型深度與容量
+6. Focal Loss 針對困難樣本
 """
 
 import argparse       # 解析命令列參數
@@ -15,7 +23,7 @@ from torch.utils.data import Dataset, DataLoader
 from sklearn.model_selection import train_test_split   # 切分訓練/驗證集
 from sklearn.metrics import f1_score, roc_auc_score    # 評估指標
 
-# ─────────────────────────────────────────────────────────────
+# ────────────────────────────────────��────────────────────────
 # 固定隨機種子，確保每次執行結果可重現
 # ─────────────────────────────────────────────────────────────
 SEED = 42
@@ -39,6 +47,37 @@ FEATURES = [
     "strikeNumber"  # 本回合擊球編號
 ]
 PAD_TOKEN = 0  # 填充值（padding），用於對齊不同長度的序列
+
+
+# ─────────────────────────────────────────────────────────────
+# Focal Loss for imbalanced multi-class classification
+# ─────────────────────────────────────────────────────────────
+class FocalLoss(nn.Module):
+    """
+    Focal Loss 針對困難樣本，減少容易樣本的權重。
+    γ (gamma) 越大，對困難樣本的關注度越高。
+    """
+    def __init__(self, weight=None, ignore_index=-1, gamma=2.0, alpha=0.25):
+        super().__init__()
+        self.weight = weight
+        self.ignore_index = ignore_index
+        self.gamma = gamma
+        self.alpha = alpha
+        self.ce = nn.CrossEntropyLoss(
+            weight=weight, ignore_index=ignore_index, reduction='none'
+        )
+
+    def forward(self, logits, targets):
+        ce_loss = self.ce(logits, targets)
+        p = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1 - p) ** self.gamma * ce_loss
+        # 重新應用 ignore_index 過濾
+        if self.ignore_index >= 0:
+            mask = (targets != self.ignore_index)
+            focal_loss = focal_loss[mask].mean() if mask.sum() > 0 else focal_loss.mean()
+        else:
+            focal_loss = focal_loss.mean()
+        return focal_loss
 
 
 # ─────────────────────────────────────────────────────────────
@@ -72,52 +111,79 @@ class RallyDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────
-# 多任務 LSTM 模型
+# 改進的多任務 LSTM 模型
 # ─────────────────────────────────────────────────────────────
-class MultiTaskLSTM(nn.Module):
+class ImprovedMultiTaskLSTM(nn.Module):
     """
-    同時預測三個目標的 LSTM 模型：
-      1. act_head  → 下一拍動作 (actionId)，序列逐步輸出
-      2. pt_head   → 下一拍得分類型 (pointId)，序列逐步輸出
-      3. rly_head  → 發球方是否得分 (serverGetPoint)，整個回合一個預測值
-
+    【改進版本】
+    1. 雙向 LSTM (Bidirectional=True) - 能捕捉前後文脈
+    2. 特徵融合層 (Fusion Module) - 強化動作/得分預測的表現
+    3. 深度與容量提升 - 更好的特徵學習
+    
     架構：
       Embedding 層 × 11 個特徵
       ↓
-      LSTM（可多層）
+      BiLSTM（多層）
       ↓
       Dropout
+      ↓
+      特徵融合層（可選）
       ↓
       三個獨立的線性輸出頭
     """
     def __init__(self, num_tokens_per_feature, n_act, n_pt,
-                 emb_dim=16, hidden=128, num_layers=1, dropout=0.2):
+                 emb_dim=24, hidden=192, num_layers=2, dropout=0.3, use_fusion=True):
         super().__init__()
 
         # 為每個類別特徵建立獨立的 Embedding 層
-        # n+1 是因為 index 0 保留給 PAD_TOKEN（padding_idx=0 時梯度為 0）
         self.embs = nn.ModuleList([
             nn.Embedding(n + 1, emb_dim, padding_idx=PAD_TOKEN)
             for n in num_tokens_per_feature
         ])
 
-        # LSTM：輸入維度 = 特徵數 × embedding 維度
-        # dropout 只在 num_layers > 1 時生效（單層 LSTM 不支援 dropout）
+        # 雙向 LSTM：能同時利用前向和反向信息
         self.lstm = nn.LSTM(
             len(num_tokens_per_feature) * emb_dim,
             hidden,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=False
+            bidirectional=True  # ← 關鍵改進：雙向
         )
 
-        self.drop = nn.Dropout(dropout)  # 防止過擬合
+        self.drop = nn.Dropout(dropout)
 
-        # 三個任務的輸出頭（線性層）
-        self.act_head = nn.Linear(hidden, n_act)   # 動作分類
-        self.pt_head  = nn.Linear(hidden, n_pt)    # 得分類型分類
-        self.rly_head = nn.Linear(hidden, 1)       # 回合結果（二元分類）
+        # 當使用 bidirectional，隱藏層維度加倍
+        lstm_output_dim = hidden * 2
+
+        # 特徵融合層：強化動作與得分的預測表現
+        self.use_fusion = use_fusion
+        if use_fusion:
+            self.fusion_act = nn.Sequential(
+                nn.Linear(lstm_output_dim, lstm_output_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(lstm_output_dim, lstm_output_dim // 2)
+            )
+            self.fusion_pt = nn.Sequential(
+                nn.Linear(lstm_output_dim, lstm_output_dim),
+                nn.ReLU(),
+                nn.Dropout(dropout),
+                nn.Linear(lstm_output_dim, lstm_output_dim // 2)
+            )
+            self.fusion_rly = nn.Sequential(
+                nn.Linear(lstm_output_dim, hidden),
+                nn.ReLU(),
+                nn.Dropout(dropout)
+            )
+            # 輸出頭
+            self.act_head = nn.Linear(lstm_output_dim // 2, n_act)
+            self.pt_head  = nn.Linear(lstm_output_dim // 2, n_pt)
+            self.rly_head = nn.Linear(hidden, 1)
+        else:
+            self.act_head = nn.Linear(lstm_output_dim, n_act)
+            self.pt_head  = nn.Linear(lstm_output_dim, n_pt)
+            self.rly_head = nn.Linear(lstm_output_dim, 1)
 
     def forward(self, X, lengths):
         """
@@ -132,30 +198,40 @@ class MultiTaskLSTM(nn.Module):
         es = [emb(X[:, :, i]) for i, emb in enumerate(self.embs)]
         x = torch.cat(es, dim=-1)  # (batch, MAXLEN, num_features * emb_dim)
 
-        # 打包序列以忽略 padding，提升計算效率
+        # 打包序列以忽略 padding
         packed = nn.utils.rnn.pack_padded_sequence(
             x, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
         o, _ = self.lstm(packed)
-        # 解包回原始形狀，total_length 確保維度一致
+        # 解包回原始形狀
         o, _ = nn.utils.rnn.pad_packed_sequence(
             o, batch_first=True, total_length=X.size(1)
         )
         o = self.drop(o)  # dropout
 
-        # 建立遮罩：只有非 PAD 的位置為 1
+        # 建立遮罩
         mask  = (X[:, :, 0] != PAD_TOKEN).float().unsqueeze(-1)  # (batch, MAXLEN, 1)
-        denom = mask.sum(dim=1).clamp(min=1.0)  # 避免除以 0
+        denom = mask.sum(dim=1).clamp(min=1.0)
 
         # 對所有非 PAD 時間步取平均，作為回合整體表示
-        mean_hidden = (o * mask).sum(dim=1) / denom  # (batch, hidden)
+        mean_hidden = (o * mask).sum(dim=1) / denom  # (batch, hidden*2)
 
-        # 回傳三個任務的輸出
-        return (
-            self.act_head(o),                        # 逐步動作預測
-            self.pt_head(o),                         # 逐步得分預測
-            self.rly_head(mean_hidden).squeeze(1)    # 回合結果預測
-        )
+        # 應用融合層並回傳輸出
+        if self.use_fusion:
+            act_fused = self.fusion_act(o)
+            pt_fused  = self.fusion_pt(o)
+            rly_fused = self.fusion_rly(mean_hidden)
+            return (
+                self.act_head(act_fused),
+                self.pt_head(pt_fused),
+                self.rly_head(rly_fused).squeeze(1)
+            )
+        else:
+            return (
+                self.act_head(o),
+                self.pt_head(o),
+                self.rly_head(mean_hidden).squeeze(1)
+            )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -284,23 +360,27 @@ def main(args):
     num_tokens_per_feature = [len(cats[c]) + 1 for c in FEATURES]  # 每個特徵的 token 數
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model = MultiTaskLSTM(
+    model = ImprovedMultiTaskLSTM(
         num_tokens_per_feature, n_act, n_pt,
         emb_dim=args.emb, hidden=args.hidden,
-        num_layers=args.layers, dropout=args.drop
+        num_layers=args.layers, dropout=args.drop, use_fusion=True
     ).to(device)
 
-    # 加權交叉熵（ignore_index=-1 跳過填充位置）
-    ce_action = nn.CrossEntropyLoss(ignore_index=-1, weight=act_w.to(device))
-    ce_point  = nn.CrossEntropyLoss(ignore_index=-1, weight=pt_w.to(device))
-    # 二元交叉熵（回合結果為 0/1）
+    # 使用 Focal Loss 針對困難樣本
+    # actionId 與 pointId 使用 Focal Loss 提高精度
+    focal_action = FocalLoss(ignore_index=-1, weight=act_w.to(device), gamma=2.0)
+    focal_point  = FocalLoss(ignore_index=-1, weight=pt_w.to(device), gamma=2.0)
+    # 回合結果使用標準 BCE
     bce_rally = nn.BCEWithLogitsLoss()
 
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
+    
+    # 動態學習率調度（每 3 個 epoch 降低 0.9 倍）
+    scheduler = torch.optim.lr_scheduler.StepLR(opt, step_size=3, gamma=0.9)
 
     best_score = -1
     wait = 0
-    patience = 10
+    patience = 15  # 增加 patience
 
     # ── 10. 訓練迴圈 ──────────────────────────────────────────
     for ep in range(1, args.epochs + 1):
@@ -317,18 +397,21 @@ def main(args):
             # 前向傳播
             la, lp, lr = model(Xb, Lb)
 
-            # 多任務損失：動作 40% + 得分類型 40% + 回合結果 20%
+            # 多任務損失：提高 actionId/pointId 的權重 (50%/30%/20%)
             loss = (
-                0.4 * ce_action(la.view(-1, la.size(-1)), yAb.view(-1)) +
-                0.4 * ce_point(lp.view(-1, lp.size(-1)),  yPb.view(-1)) +
+                0.5 * focal_action(la.view(-1, la.size(-1)), yAb.view(-1)) +
+                0.3 * focal_point(lp.view(-1, lp.size(-1)),  yPb.view(-1)) +
                 0.2 * bce_rally(lr, yRb)
             )
 
             loss.backward()
-            # 梯度裁剪，防止梯度爆炸（max norm = 1.0）
+            # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             run_loss += loss.item() * Xb.size(0)
+
+        # 學習率調度
+        scheduler.step()
 
         # ── 11. 驗證 ─────────────────────────────────────────
         model.eval()
@@ -346,17 +429,17 @@ def main(args):
                 la, lp, lr = model(Xb, Lb)
 
                 loss = (
-                    0.4 * ce_action(la.view(-1, la.size(-1)), yAb.view(-1)) +
-                    0.4 * ce_point(lp.view(-1, lp.size(-1)),  yPb.view(-1)) +
+                    0.5 * focal_action(la.view(-1, la.size(-1)), yAb.view(-1)) +
+                    0.3 * focal_point(lp.view(-1, lp.size(-1)),  yPb.view(-1)) +
                     0.2 * bce_rally(lr, yRb)
                 )
                 val_loss += loss.item() * Xb.size(0)
 
-                # 收集回合結果預測（需過 sigmoid 轉換為機率）
+                # 收集回合結果預測
                 allR  += yRb.detach().cpu().tolist()
                 allRp += torch.sigmoid(lr).detach().cpu().tolist()
 
-                # 收集動作與得分的預測（取 argmax 當預測類別）
+                # 收集動作與得分的預測
                 yA_flat = yAb.view(-1).detach().cpu().numpy()
                 yP_flat = yPb.view(-1).detach().cpu().numpy()
                 a_pred  = la.argmax(-1).view(-1).detach().cpu().numpy()
@@ -382,8 +465,8 @@ def main(args):
         except Exception:
             f1A, f1P, auc = 0.0, 0.0, 0.5
 
-        # 最終加權分數（與損失函數權重相同：40%+40%+20%）
-        final = 0.4 * f1A + 0.4 * f1P + 0.2 * auc
+        # 最終加權分數（與損失函數權重相同：50%+30%+20%）
+        final = 0.5 * f1A + 0.3 * f1P + 0.2 * auc
         print(
             f"[Epoch {ep}/{args.epochs}] "
             f"train_loss={tr_loss:.4f} val_loss={va_loss:.4f} "
@@ -466,12 +549,12 @@ if __name__ == "__main__":
     ap.add_argument("--test",     default="old_test.csv")             # 測試資料路徑
     ap.add_argument("--sample",   default="sample_submission.csv")# 提交範本路徑
     ap.add_argument("--out",      default="submission_lstm_baseline.csv") # 輸出路徑
-    ap.add_argument("--epochs",   type=int,   default=20)          # 訓練 epoch 數
+    ap.add_argument("--epochs",   type=int,   default=30)          # 訓練 epoch 數（增加）
     ap.add_argument("--batch",    type=int,   default=64)         # 批次大小
-    ap.add_argument("--emb",      type=int,   default=16)         # Embedding 維度
-    ap.add_argument("--hidden",   type=int,   default=128)        # LSTM 隱藏層維度
-    ap.add_argument("--layers",   type=int,   default=1)          # LSTM 層數
-    ap.add_argument("--drop",     type=float, default=0.2)        # Dropout 比例
+    ap.add_argument("--emb",      type=int,   default=24)         # Embedding 維度（增加）
+    ap.add_argument("--hidden",   type=int,   default=192)        # LSTM 隱藏層維度（增加）
+    ap.add_argument("--layers",   type=int,   default=2)          # LSTM 層數（增加）
+    ap.add_argument("--drop",     type=float, default=0.3)        # Dropout 比例（增加）
     ap.add_argument("--lr",       type=float, default=1e-3)       # 學習率
     ap.add_argument("--val_size", type=float, default=0.10)       # 驗證集比例
     args = ap.parse_args()
