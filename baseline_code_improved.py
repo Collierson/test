@@ -4,11 +4,11 @@ baseline_code_annotated.py
 多任務 LSTM 模型：預測乒乓球比賽的下一個動作(actionId)、
 得分類型(pointId)，以及發球方是否得分(serverGetPoint)。
 
-【穩定優化版本】
-- BiLSTM + 標準 CrossEntropy Loss（移除有問題的 Focal Loss）
-- 簡化融合層，確保梯度流動正常
-- 降低學習率以穩定訓練
-- 保留核心改進：BiLSTM、更高權重、模型容量提升
+【修復版本 - 解決資料外洩問題】
+- 按 rally_uid 級別劃分訓練/驗證集（避免同一回合的資料洩漏）
+- BiLSTM 架構保留
+- 增加 Early Stopping 防止過擬合
+- 降低模型容量防止過擬合
 """
 
 import argparse       # 解析命令列參數
@@ -78,18 +78,18 @@ class RallyDataset(Dataset):
 
 
 # ─────────────────────────────────────────────────────────────
-# 改進的多任務 BiLSTM 模型
+# 改進的多任務 BiLSTM 模型（防止過擬合）
 # ─────────────────────────────────────────────────────────────
 class ImprovedMultiTaskLSTM(nn.Module):
     """
-    【穩定改進版本】
-    1. BiLSTM (雙向) - 利用前後文脈，性能更好
-    2. 簡化架構 - 直接的輸出層，確保梯度流動
-    3. 標準 CrossEntropy Loss - 移除 Focal Loss
-    4. 增加模型容量 - 更深、更寬的網絡
+    【資料洩漏修復版本】
+    1. BiLSTM (雙向) - 利用前後文脈
+    2. 簡化架構 - 防止過擬合
+    3. 更強的 Dropout - 正規化更強
+    4. 適中的模型容量 - 避免過度學習
     """
     def __init__(self, num_tokens_per_feature, n_act, n_pt,
-                 emb_dim=20, hidden=160, num_layers=2, dropout=0.25):
+                 emb_dim=18, hidden=128, num_layers=2, dropout=0.35):
         super().__init__()
 
         # 為每個類別特徵建立獨立的 Embedding 層
@@ -98,40 +98,36 @@ class ImprovedMultiTaskLSTM(nn.Module):
             for n in num_tokens_per_feature
         ])
 
-        # 雙向 LSTM：輸入維度 = 特徵數 × embedding 維度
+        # 雙向 LSTM
         self.lstm = nn.LSTM(
             len(num_tokens_per_feature) * emb_dim,
             hidden,
             num_layers=num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0.0,
-            bidirectional=True  # ← BiLSTM: 輸出維度會是 hidden*2
+            bidirectional=True
         )
 
         self.drop = nn.Dropout(dropout)
 
-        # BiLSTM 的輸出維度是 hidden*2（前向 + 反向）
+        # BiLSTM 的輸出維度是 hidden*2
         lstm_output_dim = hidden * 2
 
-        # 三個任務的輸出頭（直接線性層，無融合層以避免問題）
-        self.act_head = nn.Linear(lstm_output_dim, n_act)   # 動作分類
-        self.pt_head  = nn.Linear(lstm_output_dim, n_pt)    # 得分類型分類
-        self.rly_head = nn.Linear(lstm_output_dim, 1)       # 回合結果（二元分類）
+        # 三個任務的輸出頭
+        self.act_head = nn.Linear(lstm_output_dim, n_act)
+        self.pt_head  = nn.Linear(lstm_output_dim, n_pt)
+        self.rly_head = nn.Linear(lstm_output_dim, 1)
 
     def forward(self, X, lengths):
         """
         X       : (batch, MAXLEN, num_features) 輸入特徵
         lengths : (batch,) 每個回合的實際長度
-        回傳：
-          la  : (batch, MAXLEN, n_act)  — 動作 logits
-          lp  : (batch, MAXLEN, n_pt)   — 得分 logits
-          lr  : (batch,)                — 回合結果 logit（未過 sigmoid）
         """
-        # 每個特徵分別做 embedding，然後在最後一維拼接
+        # 每個特徵分別做 embedding
         es = [emb(X[:, :, i]) for i, emb in enumerate(self.embs)]
-        x = torch.cat(es, dim=-1)  # (batch, MAXLEN, num_features * emb_dim)
+        x = torch.cat(es, dim=-1)
 
-        # 打包序列以忽略 padding，提升計算效率
+        # 打包序列以忽略 padding
         packed = nn.utils.rnn.pack_padded_sequence(
             x, lengths.cpu(), batch_first=True, enforce_sorted=False
         )
@@ -140,41 +136,35 @@ class ImprovedMultiTaskLSTM(nn.Module):
         o, _ = nn.utils.rnn.pad_packed_sequence(
             o, batch_first=True, total_length=X.size(1)
         )
-        o = self.drop(o)  # dropout
+        o = self.drop(o)
 
-        # 建立遮罩：只有非 PAD 的位置為 1
-        mask  = (X[:, :, 0] != PAD_TOKEN).float().unsqueeze(-1)  # (batch, MAXLEN, 1)
-        denom = mask.sum(dim=1).clamp(min=1.0)  # 避免除以 0
+        # 建立遮罩
+        mask  = (X[:, :, 0] != PAD_TOKEN).float().unsqueeze(-1)
+        denom = mask.sum(dim=1).clamp(min=1.0)
 
-        # 對所有非 PAD 時間步取平均，作為回合整體表示
-        mean_hidden = (o * mask).sum(dim=1) / denom  # (batch, lstm_output_dim)
+        # 對所有非 PAD 時間步取平均
+        mean_hidden = (o * mask).sum(dim=1) / denom
 
         # 回傳三個任務的輸出
         return (
-            self.act_head(o),                        # 逐步動作預測
-            self.pt_head(o),                         # 逐步得分預測
-            self.rly_head(mean_hidden).squeeze(1)    # 回合結果預測
+            self.act_head(o),
+            self.pt_head(o),
+            self.rly_head(mean_hidden).squeeze(1)
         )
 
 
 # ─────────────────────────────────────────────────────────────
-# 工具函數：填充序列至固定長度
+# 工具函數
 # ─────────────────────────────────────────────────────────────
 def pad2d(a, m, pad_val=PAD_TOKEN):
-    """
-    將 2D 陣列 a（形狀 T × F）填充至長度 m。
-    超出部分填入 pad_val（預設 0）。
-    """
+    """將 2D 陣列填充至長度 m"""
     out = np.full((m, a.shape[1]), pad_val, dtype=np.int64)
     out[:len(a)] = a
     return out
 
 
 def pad1d(a, m, ignore_index=-1):
-    """
-    將 1D 標籤陣列填充至長度 m。
-    填充值為 -1（CrossEntropyLoss 的 ignore_index，訓練時忽略）。
-    """
+    """將 1D 標籤陣列填充至長度 m"""
     out = np.full((m,), ignore_index, dtype=np.int64)
     out[:len(a)] = a
     return out
@@ -187,87 +177,97 @@ def main(args):
     # ── 1. 讀取資料 ──────────────────────────────────────────
     train = pd.read_csv(args.train).sort_values(["rally_uid", "strikeNumber"])
     test  = pd.read_csv(args.test).sort_values(["rally_uid", "strikeNumber"])
-    sub   = pd.read_csv(args.sample)  # 提交範本（只取格式）
+    sub   = pd.read_csv(args.sample)
 
-    # 截斷異常大的 strikeNumber（最多 40 拍）
+    # 截斷異常大的 strikeNumber
     train["strikeNumber"] = train["strikeNumber"].clip(0, 40)
     test["strikeNumber"]  = test["strikeNumber"].clip(0, 40)
 
     # ── 2. 類別編碼 ──────────────────────────────────────────
-    # 用訓練集的類別集合建立編碼字典（避免測試集引入未知類別）
     cats = {c: pd.Categorical(train[c]).categories for c in FEATURES}
 
     def encode_frame(df):
-        """將 DataFrame 轉為整數編碼矩陣（形狀 T × num_features）。
-        Categorical codes 從 -1 開始（未知類別），+1 後 0 保留給 PAD_TOKEN。
-        """
+        """將 DataFrame 轉為整數編碼矩陣"""
         outs = []
         for col in FEATURES:
             codes = pd.Categorical(df[col], categories=cats[col]).codes + 1
             outs.append(np.asarray(codes, dtype=np.int64))
-        return np.stack(outs, axis=1)  # (T, num_features)
+        return np.stack(outs, axis=1)
 
     # ── 3. 建立訓練樣本（以回合為單位）──────────────────────
+    rally_uids = []  # 記錄每個樣本所屬的 rally_uid
     X_list, yA_list, yP_list, yR_list, L_list = [], [], [], [], []
 
     for rid, g in train.groupby("rally_uid"):
         if len(g) < 2:
-            continue  # 至少需要 2 拍才能做「下一拍預測」
+            continue
 
-        # 輸入：第 1 到倒數第 2 拍（去掉最後一拍）
         X  = encode_frame(g)[:-1]
-        # 目標：第 2 到最後一拍（每個位置預測「下一拍」）
         yA = g["actionId"].values[1:].astype(np.int64)
         yP = g["pointId"].values[1:].astype(np.int64)
 
         X_list.append(X)
         yA_list.append(yA)
         yP_list.append(yP)
-        yR_list.append(int(g["serverGetPoint"].iloc[0]))  # 回合結果（固定值）
-        L_list.append(len(X))  # 序列實際長度
+        yR_list.append(int(g["serverGetPoint"].iloc[0]))
+        L_list.append(len(X))
+        rally_uids.append(rid)  # 記錄 rally_uid
 
-    # ── 4. 填充至最大長度，堆疊成矩陣 ───────────────────────
+    # ── 4. 填充至最大長度 ───────────────────────────────────
     MAXLEN = max(L_list)
-    X_all  = np.stack([pad2d(s, MAXLEN) for s in X_list])   # (N, MAXLEN, F)
-    yA_all = np.stack([pad1d(s, MAXLEN) for s in yA_list])  # (N, MAXLEN)
-    yP_all = np.stack([pad1d(s, MAXLEN) for s in yP_list])  # (N, MAXLEN)
-    yR_all = np.array(yR_list, dtype=np.float32)             # (N,)
-    L_all  = np.array(L_list,  dtype=np.int64)               # (N,)
+    X_all  = np.stack([pad2d(s, MAXLEN) for s in X_list])
+    yA_all = np.stack([pad1d(s, MAXLEN) for s in yA_list])
+    yP_all = np.stack([pad1d(s, MAXLEN) for s in yP_list])
+    yR_all = np.array(yR_list, dtype=np.float32)
+    L_all  = np.array(L_list,  dtype=np.int64)
+    rally_uids = np.array(rally_uids)
 
-    # ── 5. 重新映射標籤至連續整數（CrossEntropyLoss 需要） ──
-    # 動作類別
+    # ── 5. 重新映射標籤至連續整數 ──────────────────────────
     act_classes = np.sort(train["actionId"].unique())
     n_act       = len(act_classes)
     act_id2idx  = {v: i for i, v in enumerate(act_classes)}
 
-    # 得分類型類別
     pt_classes  = np.sort(train["pointId"].unique())
     n_pt        = len(pt_classes)
     pt_id2idx   = {v: i for i, v in enumerate(pt_classes)}
 
-    # 將原始 ID 映射為連續索引（未知值保持 -1，訓練時忽略）
     yA_all = np.vectorize(act_id2idx.get)(yA_all, -1)
     yP_all = np.vectorize(pt_id2idx.get)(yP_all, -1)
 
-    # ── 6. 切分訓練集與驗證集（依回合結果做分層抽樣）────────
-    idx = np.arange(len(X_all))
-    tr_idx, va_idx = train_test_split(
-        idx, test_size=args.val_size, random_state=42,
-        stratify=(yR_all > 0.5)  # 保持正負比例
+    # ── 6. 【修復】按 rally_uid 級別劃分訓練/驗證集 ────────
+    # 這樣可以避免同一個回合的資料在訓練集和驗證集中都出現
+    print("按 rally_uid 級別劃分資料集（防止資料洩漏）...")
+    
+    # 獲得每個 rally_uid 對應的樣本索引
+    unique_rally_uids = np.unique(rally_uids)
+    tr_rally_idx, va_rally_idx = train_test_split(
+        np.arange(len(unique_rally_uids)),
+        test_size=args.val_size,
+        random_state=42
     )
+    
+    tr_rally_set = set(unique_rally_uids[tr_rally_idx])
+    va_rally_set = set(unique_rally_uids[va_rally_idx])
+    
+    # 根據 rally_uid 劃分樣本索引
+    tr_idx = np.where([rid in tr_rally_set for rid in rally_uids])[0]
+    va_idx = np.where([rid in va_rally_set for rid in rally_uids])[0]
+    
+    print(f"訓練集回合數：{len(tr_rally_set)}, 樣本數：{len(tr_idx)}")
+    print(f"驗證集回合數：{len(va_rally_set)}, 樣本數：{len(va_idx)}")
+
     X_tr,  X_va  = X_all[tr_idx],  X_all[va_idx]
     yA_tr, yA_va = yA_all[tr_idx], yA_all[va_idx]
     yP_tr, yP_va = yP_all[tr_idx], yP_all[va_idx]
     yR_tr, yR_va = yR_all[tr_idx], yR_all[va_idx]
     L_tr,  L_va  = L_all[tr_idx],  L_all[va_idx]
 
-    # ── 7. 計算類別權重（解決類別不平衡問題）────────────────
-    # 頻率越低的類別，權重越高
+    # ── 7. 計算類別權重 ──────────────────────────────────────
     act_counts = np.bincount(yA_tr[yA_tr != -1].ravel(), minlength=n_act) + 1
     pt_counts  = np.bincount(yP_tr[yP_tr != -1].ravel(), minlength=n_pt)  + 1
 
     act_w = torch.tensor(1.0 / act_counts, dtype=torch.float32)
-    act_w = act_w * (n_act / act_w.sum())   # 正規化使總和 = n_act
+    act_w = act_w * (n_act / act_w.sum())
 
     pt_w  = torch.tensor(1.0 / pt_counts,  dtype=torch.float32)
     pt_w  = pt_w  * (n_pt  / pt_w.sum())
@@ -280,7 +280,7 @@ def main(args):
     val_loader   = DataLoader(val_ds, batch_size=max(args.batch * 2, 128), shuffle=False)
 
     # ── 9. 建立模型與損失函數 ─────────────────────────────────
-    num_tokens_per_feature = [len(cats[c]) + 1 for c in FEATURES]  # 每個特徵的 token 數
+    num_tokens_per_feature = [len(cats[c]) + 1 for c in FEATURES]
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     model = ImprovedMultiTaskLSTM(
@@ -289,21 +289,19 @@ def main(args):
         num_layers=args.layers, dropout=args.drop
     ).to(device)
 
-    # 標準加權交叉熵（更穩定，移除 Focal Loss）
+    # 標準加權交叉熵
     ce_action = nn.CrossEntropyLoss(ignore_index=-1, weight=act_w.to(device))
     ce_point  = nn.CrossEntropyLoss(ignore_index=-1, weight=pt_w.to(device))
-    # 二元交叉熵（回合結果為 0/1）
     bce_rally = nn.BCEWithLogitsLoss()
 
-    # 降低學習率以提升穩定性
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        opt, mode='max', factor=0.5, patience=3
+        opt, mode='max', factor=0.8, patience=2
     )
 
     best_score = -1
     wait = 0
-    patience = 12
+    patience = 8  # 更早停止以避免過擬合
 
     # ── 10. 訓練迴圈 ──────────────────────────────────────────
     for ep in range(1, args.epochs + 1):
@@ -317,18 +315,16 @@ def main(args):
             )
             opt.zero_grad()
 
-            # 前向傳播
             la, lp, lr = model(Xb, Lb)
 
-            # 多任務損失：提高 actionId 權重 (50% + 35% + 15%)
+            # 多任務損失：平衡權重（避免過度優化某一個任務）
             loss = (
-                0.50 * ce_action(la.view(-1, la.size(-1)), yAb.view(-1)) +
-                0.35 * ce_point(lp.view(-1, lp.size(-1)),  yPb.view(-1)) +
-                0.15 * bce_rally(lr, yRb)
+                0.40 * ce_action(la.view(-1, la.size(-1)), yAb.view(-1)) +
+                0.40 * ce_point(lp.view(-1, lp.size(-1)),  yPb.view(-1)) +
+                0.20 * bce_rally(lr, yRb)
             )
 
             loss.backward()
-            # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             opt.step()
             run_loss += loss.item() * Xb.size(0)
@@ -336,9 +332,9 @@ def main(args):
         # ── 11. 驗證 ─────────────────────────────────────────
         model.eval()
         val_loss = 0.0
-        allA, allAp = [], []   # 動作：真實值 & 預測值
-        allP, allPp = [], []   # 得分：真實值 & 預測值
-        allR, allRp = [], []   # 回合：真實值 & 預測機率
+        allA, allAp = [], []
+        allP, allPp = [], []
+        allR, allRp = [], []
 
         with torch.no_grad():
             for Xb, yAb, yPb, yRb, Lb in val_loader:
@@ -349,23 +345,21 @@ def main(args):
                 la, lp, lr = model(Xb, Lb)
 
                 loss = (
-                    0.50 * ce_action(la.view(-1, la.size(-1)), yAb.view(-1)) +
-                    0.35 * ce_point(lp.view(-1, lp.size(-1)),  yPb.view(-1)) +
-                    0.15 * bce_rally(lr, yRb)
+                    0.40 * ce_action(la.view(-1, la.size(-1)), yAb.view(-1)) +
+                    0.40 * ce_point(lp.view(-1, lp.size(-1)),  yPb.view(-1)) +
+                    0.20 * bce_rally(lr, yRb)
                 )
                 val_loss += loss.item() * Xb.size(0)
 
-                # 收集回合結果預測
                 allR  += yRb.detach().cpu().tolist()
                 allRp += torch.sigmoid(lr).detach().cpu().tolist()
 
-                # 收集動作與得分的預測
                 yA_flat = yAb.view(-1).detach().cpu().numpy()
                 yP_flat = yPb.view(-1).detach().cpu().numpy()
                 a_pred  = la.argmax(-1).view(-1).detach().cpu().numpy()
                 p_pred  = lp.argmax(-1).view(-1).detach().cpu().numpy()
 
-                mA = (yA_flat != -1)  # 過濾填充位置
+                mA = (yA_flat != -1)
                 mP = (yP_flat != -1)
                 allA  += yA_flat[mA].tolist()
                 allAp += a_pred[mA].tolist()
@@ -384,7 +378,7 @@ def main(args):
             f1A, f1P, auc = 0.0, 0.0, 0.5
 
         # 最終加權分數
-        final = 0.50 * f1A + 0.35 * f1P + 0.15 * auc
+        final = 0.40 * f1A + 0.40 * f1P + 0.20 * auc
         print(
             f"[Epoch {ep}/{args.epochs}] "
             f"train_loss={tr_loss:.4f} val_loss={va_loss:.4f} "
@@ -392,10 +386,8 @@ def main(args):
             f"Final~{final:.4f}"
         )
 
-        # 學習率調度
         scheduler.step(final)
 
-        # 提前結束訓練
         if final > best_score:
             best_score = final
             wait = 0
@@ -409,13 +401,9 @@ def main(args):
 
 
     # ─────────────────────────────────────────────────────────
-    # 13. 推論（對測試集生成預測）
+    # 13. 推論
     # ─────────────────────────────────────────────────────────
     def pad2d_cap(a, m, pad_val=PAD_TOKEN):
-        """
-        與 pad2d 相同，但截斷超過 m 的序列（避免 MAXLEN 溢出）。
-        回傳 (填充後陣列, 實際有效長度 T)。
-        """
         out = np.full((m, a.shape[1]), pad_val, dtype=np.int64)
         T = min(len(a), m)
         out[:T] = a[:T]
@@ -428,7 +416,7 @@ def main(args):
     pred_rows = []
     with torch.no_grad():
         for rid, g in test.groupby("rally_uid"):
-            Xg = encode_frame(g)          # 編碼測試回合
+            Xg = encode_frame(g)
             Xp, T = pad2d_cap(Xg, MAXLEN)
 
             X_t = torch.tensor(Xp[None, ...], dtype=torch.long, device=device)
@@ -436,13 +424,11 @@ def main(args):
 
             la, lp, lr = model(X_t, L_t)
 
-            # 取最後一個有效時間步的預測
             last_t  = L_t.item() - 1
             a_idx   = int(torch.argmax(la[0, last_t]).item())
             p_idx   = int(torch.argmax(lp[0, last_t]).item())
             s_prob  = float(torch.sigmoid(lr).item())
 
-            # 將索引轉回原始類別 ID
             action_pred = int(act_classes[a_idx])
             point_pred  = int(pt_classes[p_idx])
 
@@ -457,8 +443,6 @@ def main(args):
     # 14. 輸出提交檔案
     # ─────────────────────────────────────────────────────────
     pred_df = pd.DataFrame(pred_rows).sort_values("rally_uid")
-
-    # 與提交範本合併（按 rally_uid 對齊），覆蓋預測欄位
     out = pred_df[["rally_uid", "actionId", "pointId", "serverGetPoint"]]
     out.to_csv(args.out, index=False)
     print(f"Saved submission to: {args.out}")
@@ -470,17 +454,17 @@ def main(args):
 # ─────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("--train",    default="train.csv")            # 訓練資料路徑
-    ap.add_argument("--test",     default="old_test.csv")         # 測試資料路徑
-    ap.add_argument("--sample",   default="sample_submission.csv")# 提交範本路徑
-    ap.add_argument("--out",      default="submission_lstm_baseline.csv") # 輸出路徑
-    ap.add_argument("--epochs",   type=int,   default=25)         # 訓練 epoch 數
-    ap.add_argument("--batch",    type=int,   default=64)        # 批次大小
-    ap.add_argument("--emb",      type=int,   default=20)        # Embedding 維度
-    ap.add_argument("--hidden",   type=int,   default=160)       # LSTM 隱藏層維度
-    ap.add_argument("--layers",   type=int,   default=2)         # LSTM 層數
-    ap.add_argument("--drop",     type=float, default=0.25)      # Dropout 比例
-    ap.add_argument("--lr",       type=float, default=5e-4)      # 學習率（降低）
-    ap.add_argument("--val_size", type=float, default=0.10)      # 驗證集比例
+    ap.add_argument("--train",    default="train.csv")
+    ap.add_argument("--test",     default="old_test.csv")
+    ap.add_argument("--sample",   default="sample_submission.csv")
+    ap.add_argument("--out",      default="submission_lstm_baseline.csv")
+    ap.add_argument("--epochs",   type=int,   default=20)
+    ap.add_argument("--batch",    type=int,   default=64)
+    ap.add_argument("--emb",      type=int,   default=18)
+    ap.add_argument("--hidden",   type=int,   default=128)
+    ap.add_argument("--layers",   type=int,   default=2)
+    ap.add_argument("--drop",     type=float, default=0.35)
+    ap.add_argument("--lr",       type=float, default=5e-4)
+    ap.add_argument("--val_size", type=float, default=0.15)
     args = ap.parse_args()
     main(args)
